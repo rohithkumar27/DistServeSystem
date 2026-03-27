@@ -7,6 +7,8 @@ class Request:
     arrival_time: float
     prompt_tokens: int
     output_tokens: int
+    # Set for GPU runs (ShareGPT / real prompts); simulator-only workloads may omit.
+    prompt_text: str | None = None
 
 
 @dataclass(slots=True)

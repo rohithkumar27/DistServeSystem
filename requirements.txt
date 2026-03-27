@@ -1,5 +1,10 @@
+# Core simulator (Stage A)
 numpy
-pandas
-simpy
-matplotlib
 pytest
+
+# Stage B: real measurements + ShareGPT (HF)
+torch>=2.0.0
+transformers>=4.38.0
+datasets>=2.16.0
+accelerate>=0.26.0
+safetensors>=0.4.0

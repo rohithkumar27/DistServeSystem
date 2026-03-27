@@ -1,0 +1,103 @@
+{
+  "batching": {
+    "decode": {
+      "batch_wait_s": 0.0,
+      "max_batch_size": 16
+    },
+    "prefill": {
+      "batch_wait_s": 0.01,
+      "max_batch_size": 8
+    }
+  },
+  "colocated": {
+    "count": 400,
+    "goodput": 0.4375,
+    "mean_e2e_latency": 1.2847912242827264,
+    "mean_tpot": 0.007853202373354885,
+    "mean_ttft": 0.9039974772212581,
+    "p50_e2e_latency": 1.2487015770942307,
+    "p50_tpot": 0.007639081192923547,
+    "p50_ttft": 0.8940079436248993,
+    "p90_e2e_latency": 2.1532731734827877,
+    "p90_tpot": 0.008774999999999977,
+    "p90_ttft": 1.7186012098587258,
+    "p95_e2e_latency": 2.4220924847069494,
+    "p95_tpot": 0.008774999999999977,
+    "p95_ttft": 1.9167221071509655,
+    "p99_e2e_latency": 2.979179890653312,
+    "p99_tpot": 0.008775000000000326,
+    "p99_ttft": 2.4256967766039765,
+    "throughput_req_per_s": 2.502015344559343,
+    "throughput_tok_per_s": 123.99988047636103
+  },
+  "disaggregated": {
+    "count": 400,
+    "goodput": 0.6975,
+    "mean_e2e_latency": 0.8541141633045966,
+    "mean_tpot": 0.006130593421260385,
+    "mean_ttft": 0.5566006104161368,
+    "p50_e2e_latency": 0.7710800656035506,
+    "p50_tpot": 0.006064714444989607,
+    "p50_ttft": 0.4977238072214245,
+    "p90_e2e_latency": 1.5517039593295836,
+    "p90_tpot": 0.006500000000000077,
+    "p90_ttft": 1.113282807475379,
+    "p95_e2e_latency": 1.692684988364651,
+    "p95_tpot": 0.0065000000000001645,
+    "p95_ttft": 1.305306041924123,
+    "p99_e2e_latency": 2.0860499746530285,
+    "p99_tpot": 0.006500000000000371,
+    "p99_ttft": 1.5336702229860153,
+    "throughput_req_per_s": 2.5040166486322306,
+    "throughput_tok_per_s": 124.09906510621336
+  },
+  "slo": {
+    "e2e_slo": null,
+    "tpot_slo": 0.03,
+    "ttft_slo": 0.8
+  },
+  "timing": {
+    "colocated_interference": 1.35,
+    "decode_base": 0.004,
+    "decode_batch_alpha": 0.1,
+    "decode_capacity_multiplier": 1.0,
+    "decode_per_token": 0.0025,
+    "prefill_base": 0.02,
+    "prefill_batch_alpha": 0.2,
+    "prefill_capacity_multiplier": 1.0,
+    "prefill_per_token": 0.0002,
+    "transfer_per_prompt_token": 1.5e-05
+  },
+  "timing_meta": null,
+  "timing_source": null,
+  "workload": {
+    "arrival_process": "bursty",
+    "arrival_rate": 2.0,
+    "burst_prob": 0.25,
+    "burst_rate_multiplier": 8.0,
+    "interactive_frac": 0.75,
+    "interactive_output_range": [
+      16,
+      64
+    ],
+    "interactive_prompt_range": [
+      32,
+      256
+    ],
+    "long_output_range": [
+      16,
+      128
+    ],
+    "long_prompt_range": [
+      1024,
+      4096
+    ],
+    "num_requests": 400,
+    "output_high": 128,
+    "output_low": 32,
+    "prompt_high": 1024,
+    "prompt_low": 128,
+    "seed": 42,
+    "use_mixture": true
+  }
+}
