@@ -1,0 +1,270 @@
+\documentclass[11pt,letterpaper]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{titlesec}
+\usepackage{amsmath}
+\usepackage{xcolor}
+\usepackage{microtype}
+\usepackage{parskip}
+
+\hypersetup{colorlinks=true, linkcolor=blue, urlcolor=blue, citecolor=blue}
+
+\titlespacing*{\section}{0pt}{10pt}{4pt}
+\titlespacing*{\subsection}{0pt}{8pt}{3pt}
+
+\title{\textbf{Milestone Report: DistServe Reimplementation}\\
+\large Separating Prefill and Decode for LLM Serving}
+\author{Systems for Deep Learning --- Course Project}
+\date{March 28, 2026}
+
+\begin{document}
+\maketitle
+\vspace{-8pt}
+\noindent\rule{\linewidth}{0.4pt}
+
+%% ============================================================
+\section{Project Goal}
+%% ============================================================
+
+The goal of this project is to reimplement the central systems insight of
+\textbf{DistServe}~\cite{zhong2024distserve}: separating LLM inference into a
+dedicated \emph{prefill pool} and a dedicated \emph{decode pool} eliminates
+prefill--decode interference and improves SLO goodput and tail latency under mixed
+workloads. We rebuild this in pure Python + PyTorch + HuggingFace (no Ray, no
+SwiftTransformer), targeting a 1-node / 2-GPU environment, and evaluate on real GPU
+hardware.
+
+%% ============================================================
+\section{What Has Been Completed}
+%% ============================================================
+
+\subsection{System Architecture}
+
+We implement two serving designs, each runnable in two modes:
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+\textbf{Design} & \textbf{Simulator} & \textbf{Real GPU} \\
+\midrule
+Colocated (baseline)             & \texttt{src/simulator/baseline.py}      & \texttt{src/runtime/baseline\_gpu.py} \\
+Disaggregated (DistServe-style)  & \texttt{src/simulator/disaggregated.py} & \texttt{src/runtime/disaggregated\_gpu.py} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Supporting modules: \texttt{src/core/\{request,metrics\}.py},
+\texttt{src/simulator/\{timing,workload,config\}.py},
+\texttt{src/runtime/inference\_core.py},
+\texttt{src/stage\_b/\{profile\_sharegpt,fitted\_timing,workload\_sharegpt\}.py}.
+
+\subsection{Real GPU Runtime (Primary Contribution)}
+
+\texttt{src/runtime/inference\_core.py} provides wall-clock timed wrappers around
+HuggingFace \texttt{forward} calls with CUDA synchronization:
+
+\begin{itemize}[noitemsep,topsep=2pt]
+  \item \textbf{\texttt{timed\_prefill}} --- single-request prefill forward; records
+        wall time bracketed by \texttt{torch.cuda.synchronize}.
+  \item \textbf{\texttt{timed\_decode\_steps}} --- greedy autoregressive decode loop;
+        records per-step wall time.
+  \item \textbf{\texttt{time\_transfer}} --- measures the wall time of moving
+        \texttt{past\_key\_values} from the prefill GPU to the decode GPU via
+        PyTorch \texttt{.to(device)} (PCIe/NVLink device-to-device copy).
+  \item \textbf{\texttt{tokenize\_batch}, \texttt{timed\_prefill\_batch},
+        \texttt{timed\_decode\_steps\_batch}} --- new batched variants using
+        left-padded tokenization; group $B$ requests into a single forward call
+        for both prefill and each decode step.
+\end{itemize}
+
+\textbf{Colocated GPU runtime} (\texttt{baseline\_gpu.py}): runs prefill then greedy
+decode on a single GPU in FIFO order, with configurable \texttt{batch\_size}.
+
+\textbf{Disaggregated GPU runtime} (\texttt{disaggregated\_gpu.py}): prefill on
+GPU~A, measured KV transfer via \texttt{time\_transfer}, decode on GPU~B.
+Batching moves the full batched KV cache as a single transfer call.
+Both GPUs load TinyLlama/TinyLlama-1.1B-Chat-v1.0 (identical weights, separate
+device instances), matching the DistServe architecture of role-specific replicas.
+
+\textbf{KV cache transfer implementation:} after prefill we read each transformer
+layer's cached keys and values from HuggingFace's \texttt{DynamicCache},
+move every tensor with \texttt{.to(decode\_device)}, and rebuild a fresh
+\texttt{DynamicCache} on the decode GPU. This is a same-node operation
+(both GPUs in the same process). Cross-node handoff is out of scope for this
+milestone and will be stated as a limitation in the final report.
+
+\subsection{Stage B: ShareGPT Profiling Pipeline}
+
+\texttt{src/stage\_b/profile\_sharegpt.py} measures actual GPU prefill and per-step
+decode latency on ShareGPT prompts, fits a linear prefill model
+($a + b \cdot \text{tokens}$) via least squares, and writes
+\texttt{results/fitted\_timing.json}. This pipeline is implemented and can be used
+to calibrate the simulator with real-hardware timing coefficients.
+
+\subsection{Simulator (Supporting Infrastructure)}
+
+A discrete-event simulator (\texttt{src/simulator/}) models both designs using a
+parametric \texttt{TimingModel}. It is used for large-scale sensitivity analysis
+(KV transfer cost sweep, capacity split sweep, arrival rate sweep) where real GPU
+runs are too slow to sweep exhaustively. Simulator results are not presented as
+primary evidence; they serve as a design and exploration tool.
+
+\subsection{Experiment Infrastructure}
+
+\begin{itemize}[noitemsep,topsep=2pt]
+  \item \texttt{run\_comparison.py} --- core colocated vs disaggregated simulator run
+  \item \texttt{run\_ablations.py} --- KV transfer cost + capacity split sweeps
+  \item \texttt{run\_load\_sweep.py} --- simulator goodput vs arrival rate curve
+  \item \texttt{run\_workload\_mix.py} --- simulator goodput vs interactive fraction
+  \item \texttt{run\_batch\_sweep\_gpu.py} --- \textbf{real GPU} batch-size sweep
+        (batch\_size $\in \{1,2,4,8\}$ for both designs)
+  \item \texttt{run\_milestone.sh} --- master script; auto-detects GPU count,
+        runs all experiments, writes results to \texttt{results/milestone/}
+\end{itemize}
+
+All outputs are timestamped CSVs + JSON metadata for reproducibility.
+
+%% ============================================================
+\section{Real GPU Evidence}
+%% ============================================================
+
+\textbf{Setup:} TinyLlama/TinyLlama-1.1B-Chat-v1.0, 2-GPU node,
+30 ShareGPT-backed requests, \texttt{batch\_size}~=~4.
+TTFT SLO~=~2.0\,s, TPOT SLO~=~0.05\,s.
+Result file: \texttt{results/20260328T000851Z-gpu-comparison-summary.json}.
+Per-request data: \texttt{results/20260328T000851Z-gpu-\{colocated,disaggregated\}-requests.csv}
+(screenshot attached as evidence).
+
+\begin{center}
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Metric} & \textbf{Colocated} & \textbf{Disaggregated} & \textbf{Change} \\
+\midrule
+Mean TTFT (s)        & 3.994 & 3.414 & \textbf{--14.5\%} \\
+p50 TTFT (s)         & 3.506 & 2.925 & --16.7\% \\
+p95 TTFT (s)         & 7.256 & 6.675 & --8.0\% \\
+Mean E2E latency (s) & 4.347 & 3.766 & --13.4\% \\
+p99 E2E latency (s)  & 8.112 & 7.516 & --7.3\% \\
+Throughput (req/s)   & 3.686 & 3.977 & \textbf{+7.9\%} \\
+SLO Goodput          & 0.40  & 0.40  & tied \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Interpretation.}
+The disaggregated design reduces mean TTFT by 14.5\% and improves throughput by
+7.9\% over the colocated baseline on identical requests and hardware. Both designs
+achieve the same SLO goodput (0.40) at this batch size and SLO threshold because
+the queuing effect at \texttt{batch\_size}~=~4 pushes mean TTFT well above the
+2.0\,s threshold for a large fraction of requests in both cases.
+The raw latency reduction is real and directionally consistent with the DistServe
+claim: separating prefill from decode reduces the time until the first token is
+produced. An earlier sequential run (\texttt{batch\_size}~=~1, 15 requests)
+showed goodput 0.333~$\to$~0.467 (+40\%) and mean TTFT
+2.629~$\to$~2.342\,s (--10.9\%), confirming the direction holds across batch sizes.
+
+\textbf{TPOT.} Mean TPOT is similar across designs (0.0192\,s vs 0.0191\,s),
+which is expected: once KV is on the decode GPU, per-step decode time is governed
+by the model and memory bandwidth, not by the prefill--decode split.
+
+%% ============================================================
+\section{What Remains Before the Final Report}
+%% ============================================================
+
+\begin{enumerate}[noitemsep,topsep=3pt]
+
+  \item \textbf{Real GPU batch-size sweep (\texttt{run\_batch\_sweep\_gpu.py}).}
+  The script is implemented but not yet run. Will produce measured throughput and
+  TTFT for \texttt{batch\_size} $\in \{1,2,4,8\}$ for both designs on real
+  hardware, showing how batching interacts with the prefill--decode split.
+
+  \item \textbf{Real GPU arrival rate sweep.}
+  The load sweep currently exists only in the simulator. Running it on real
+  hardware --- varying arrival rate across both designs and recording goodput and
+  tail latency --- is the most important remaining experiment. It would directly
+  validate the simulator's load-collapse story with measured numbers.
+
+  \item \textbf{SLO threshold sweep.}
+  Fix the workload and vary the TTFT SLO (e.g.\ 1.0\,s, 1.5\,s, 2.0\,s, 3.0\,s)
+  to produce a goodput-vs-SLO curve for both designs. This is the canonical
+  evaluation plot from the DistServe paper and shows the advantage holds across
+  different strictness levels.
+
+  \item \textbf{Direct interference measurement.}
+  Run prefill-only vs prefill+decode colocated on the same GPU and directly
+  measure the slowdown. This empirically quantifies the interference the
+  simulator approximates with a fixed 1.35$\times$ multiplier and removes the
+  need for that assumption.
+
+  \item \textbf{Larger GPU runs and longer prompts.}
+  Current GPU comparison uses 30 requests truncated to 512 tokens. Scaling to
+  100--200 requests with full ShareGPT prompts (1024--2048 tokens) will reduce
+  variance, produce stable tail-latency percentiles, and stress the prefill phase
+  more — making the KV transfer cost and interference effect more pronounced.
+
+  \item \textbf{Larger model.}
+  TinyLlama (1.1B) has short prefill times. Running on a larger model
+  (e.g.\ Llama-2-7B if GPU memory permits) would produce longer prefills,
+  stronger interference, and a larger disaggregation benefit --- closer to the
+  real-world regime the paper targets.
+
+  \item \textbf{KV transfer microbenchmark.}
+  Sweep prompt length vs measured \texttt{time\_transfer} output to fit a
+  \texttt{transfer\_per\_prompt\_token} coefficient, replacing the current
+  synthetic placeholder and closing the loop between the simulator and the GPU
+  runtime.
+
+  \item \textbf{Stage B timing calibration.}
+  Run \texttt{profile\_sharegpt.py} to produce \texttt{fitted\_timing.json}
+  and rerun simulator sweeps with measured timing coefficients, grounding the
+  simulator curves in real GPU numbers.
+
+  \item \textbf{Plots and figures.}
+  Convert result CSVs into matplotlib figures: goodput vs arrival rate,
+  goodput vs SLO threshold, TTFT CDF, batch-size throughput bar chart.
+  These will be the primary visual evidence in the final report.
+
+\end{enumerate}
+
+%% ============================================================
+\section{On Track / Blockers}
+%% ============================================================
+
+\textbf{On track.} The full real-GPU pipeline is working end-to-end: prefill,
+KV transfer, and decode are all measured on real hardware. The batching extension
+is implemented and tested. The experiment infrastructure is automated and ready
+to produce the remaining GPU runs.
+
+\textbf{No hard blockers.} All remaining work is execution and analysis: run more
+GPU experiments, calibrate timing, generate figures. No architectural changes are
+needed.
+
+\textbf{Scope boundary.} KV transfer is same-node only (device-to-device via
+\texttt{.to()}). Multi-node / NCCL-based handoff is out of scope and will be
+documented as a limitation.
+
+\textbf{Code structure:}
+\begin{itemize}[noitemsep,topsep=2pt]
+  \item \texttt{src/runtime/} --- real-GPU runtime with batching support
+  \item \texttt{src/simulator/} --- discrete-event simulator (supporting tool)
+  \item \texttt{src/stage\_b/} --- ShareGPT profiling and timing fitting
+  \item \texttt{src/experiments/} --- five experiment scripts + master runner
+  \item \texttt{results/} --- timestamped per-run CSVs and JSON summaries
+  \item \texttt{results/milestone/} --- named milestone outputs
+  \item \texttt{tests/} --- correctness tests (simulator invariants, timing fit)
+\end{itemize}
+
+\vspace{6pt}
+\noindent\rule{\linewidth}{0.4pt}
+\begin{thebibliography}{1}
+\bibitem{zhong2024distserve}
+Yinmin Zhong, Shengyu Liu, Junda Chen, Jianbo Hu, Yibo Zhu, Xuanzhe Liu,
+Xin Jin, and Hao Zhang.
+\newblock DistServe: Disaggregating Prefill and Decoding for Goodput-Optimized
+Large Language Model Serving.
+\newblock In \textit{OSDI}, 2024.
+\end{thebibliography}
+
+\end{document}

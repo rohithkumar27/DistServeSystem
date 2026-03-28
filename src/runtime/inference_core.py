@@ -162,3 +162,76 @@ def tokenize_prompt(
         max_length=max_prompt_tokens,
     )
     return enc["input_ids"].to(device)
+
+
+def tokenize_batch(
+    tokenizer,
+    prompts: list[str],
+    device: torch.device,
+    max_prompt_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Tokenize a list of prompts with left-padding so the last real token aligns at
+    position -1 across the batch. Returns (input_ids [B,L], attention_mask [B,L]).
+    """
+    orig_side = tokenizer.padding_side
+    tokenizer.padding_side = "left"
+    enc = tokenizer(
+        prompts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=max_prompt_tokens,
+    )
+    tokenizer.padding_side = orig_side
+    return enc["input_ids"].to(device), enc["attention_mask"].to(device)
+
+
+def timed_prefill_batch(
+    model: torch.nn.Module,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    device: torch.device,
+) -> tuple[float, Any, torch.Tensor]:
+    """
+    Batched prefill forward. Returns (seconds, past_key_values, next_token_ids [B,1]).
+    """
+    model.eval()
+    with torch.no_grad():
+        _sync(device)
+        t0 = time.perf_counter()
+        out = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=True)
+        _sync(device)
+        prefill_s = time.perf_counter() - t0
+    past = out.past_key_values
+    next_tokens = out.logits[:, -1:, :].argmax(dim=-1)  # [B, 1]
+    return prefill_s, past, next_tokens
+
+
+def timed_decode_steps_batch(
+    model: torch.nn.Module,
+    past: Any,
+    first_tokens: torch.Tensor,
+    max_new_tokens: int,
+    device: torch.device,
+) -> tuple[list[float], float]:
+    """
+    Greedy decode for `max_new_tokens` steps over a batch.
+    All requests in the batch run together each step; per-request finish times
+    are derived by the caller using step_times[:output_tokens].
+    Returns (per_step_seconds, total_decode_seconds).
+    """
+    model.eval()
+    next_tokens = first_tokens  # [B, 1]
+    p = past
+    step_times: list[float] = []
+    with torch.no_grad():
+        for _ in range(max_new_tokens):
+            _sync(device)
+            t0 = time.perf_counter()
+            out = model(input_ids=next_tokens, past_key_values=p, use_cache=True)
+            _sync(device)
+            step_times.append(time.perf_counter() - t0)
+            next_tokens = out.logits[:, -1:, :].argmax(dim=-1)
+            p = out.past_key_values
+    return step_times, sum(step_times)

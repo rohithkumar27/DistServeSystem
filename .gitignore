@@ -71,3 +71,4 @@ pip-wheel-metadata/
 
 # C extensions
 *.pyd
+CLAUDE.md 

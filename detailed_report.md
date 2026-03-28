@@ -1,7 +1,7 @@
 ## DistServeSystem Detailed Milestone Report
 
 ### 1. Project Goal
-This milestone focuses on reimplementing the central DistServe systems idea in a course-friendly setting: prefill and decode should be separated so long-prompt prefills do not interfere with latency-sensitive decoding. Instead of reproducing the original Ray- and SwiftTransformer-based stack, this repo rebuilds the architecture in Python with two complementary execution modes:
+This milestone focuses on reimplementing the central DistServe systems idea : prefill and decode should be separated so long-prompt prefills do not interfere with latency-sensitive decoding. Instead of reproducing the original Ray- and SwiftTransformer-based stack, this repo rebuilds the architecture in Python with two complementary execution modes:
 
 - a simulator that lets us study queueing, batching, SLO goodput, and KV-transfer overhead quickly
 - a real-GPU runtime that measures actual HuggingFace forward passes and KV-cache transfer behavior

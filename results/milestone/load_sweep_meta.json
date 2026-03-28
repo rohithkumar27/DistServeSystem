@@ -1,4 +1,14 @@
 {
+  "arrival_rates": [
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    2.5,
+    3.0,
+    3.5,
+    4.0
+  ],
   "batching": {
     "decode": {
       "batch_wait_s": 0.0,
@@ -9,15 +19,16 @@
       "max_batch_size": 8
     }
   },
-  "outputs": {
-    "table_csv": "results/20260326T035134Z-ablations.csv"
-  },
+  "description": "Goodput and latency vs arrival rate for colocated vs disaggregated",
+  "experiment": "load_sweep",
+  "num_requests": 500,
+  "seed": 42,
   "slo": {
     "e2e_slo": null,
     "tpot_slo": 0.03,
     "ttft_slo": 0.8
   },
-  "timing_base": {
+  "timing": {
     "colocated_interference": 1.35,
     "decode_base": 0.004,
     "decode_batch_alpha": 0.1,
@@ -29,11 +40,9 @@
     "prefill_per_token": 0.0002,
     "transfer_per_prompt_token": 1.5e-05
   },
+  "timing_source": "synthetic_defaults",
   "workload": {
     "arrival_process": "bursty",
-    "arrival_rate": 2.2,
-    "burst_prob": 0.25,
-    "burst_rate_multiplier": 8.0,
     "interactive_frac": 0.75,
     "interactive_output_range": [
       16,
@@ -51,12 +60,6 @@
       1024,
       4096
     ],
-    "num_requests": 600,
-    "output_high": 128,
-    "output_low": 32,
-    "prompt_high": 1024,
-    "prompt_low": 128,
-    "seed": 7,
     "use_mixture": true
   }
 }

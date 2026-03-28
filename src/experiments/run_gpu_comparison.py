@@ -39,6 +39,9 @@ def main() -> None:
     parser.add_argument("--baseline-gpu", type=int, default=0)
     parser.add_argument("--prefill-gpu", type=int, default=0)
     parser.add_argument("--decode-gpu", type=int, default=1)
+    parser.add_argument("--batch-size", type=int, default=1,
+                        help="Number of requests per GPU batch (prefill + decode). "
+                             "1 = original sequential behaviour.")
     parser.add_argument("--ttft-slo", type=float, default=2.0)
     parser.add_argument("--tpot-slo", type=float, default=0.05)
     parser.add_argument(
@@ -91,6 +94,7 @@ def main() -> None:
         tokenizer=tok_b,
         device=baseline_dev,
         max_prompt_tokens=args.max_prompt_tokens,
+        batch_size=args.batch_size,
     )
     sum_coloc = summarize_results(colocated, slo)
 
@@ -114,6 +118,7 @@ def main() -> None:
             prefill_device=prefill_dev,
             decode_device=decode_dev,
             max_prompt_tokens=args.max_prompt_tokens,
+            batch_size=args.batch_size,
         )
         sum_dis = summarize_results(disagg, slo)
         print("\n=== Disaggregated (prefill + decode GPUs) ===")
@@ -129,6 +134,7 @@ def main() -> None:
         {
             "model": args.model,
             "num_requests": len(requests),
+            "batch_size": args.batch_size,
             "baseline_gpu": args.baseline_gpu,
             "prefill_gpu": args.prefill_gpu,
             "decode_gpu": args.decode_gpu,
