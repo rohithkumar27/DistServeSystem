@@ -1,6 +1,6 @@
 # DistServeSystem — Complete Architecture Explanation
 
-This document walks through the entire system step by step, from how a request enters the system to how metrics are computed and reported.
+This document walks through the real-GPU inference system step by step, from how a ShareGPT prompt enters the pipeline to how metrics are computed and reported.
 
 ---
 
@@ -8,17 +8,15 @@ This document walks through the entire system step by step, from how a request e
 
 1. [The Core Problem](#1-the-core-problem)
 2. [Request Representation](#2-request-representation)
-3. [Timing Model](#3-timing-model)
-4. [Workload Generation](#4-workload-generation)
-5. [Colocated (Baseline) Simulator](#5-colocated-baseline-simulator)
-6. [Disaggregated Simulator](#6-disaggregated-simulator)
-7. [Real GPU Runtime — Shared Inference Core](#7-real-gpu-runtime--shared-inference-core)
-8. [Real GPU Runtime — Baseline (1 GPU)](#8-real-gpu-runtime--baseline-1-gpu)
-9. [Real GPU Runtime — Disaggregated (2 GPUs)](#9-real-gpu-runtime--disaggregated-2-gpus)
-10. [Stage B — Profiling and Fitting Real GPU Timings](#10-stage-b--profiling-and-fitting-real-gpu-timings)
-11. [Metrics Computation](#11-metrics-computation)
-12. [Experiment Runners](#12-experiment-runners)
-13. [End-to-End Data Flow Diagram](#13-end-to-end-data-flow-diagram)
+3. [ShareGPT Workload Generation](#3-sharegpt-workload-generation)
+4. [Real GPU Runtime — Shared Inference Core](#4-real-gpu-runtime--shared-inference-core)
+5. [Real GPU Runtime — Baseline (1 GPU, Colocated)](#5-real-gpu-runtime--baseline-1-gpu-colocated)
+6. [Real GPU Runtime — Disaggregated (2 GPUs)](#6-real-gpu-runtime--disaggregated-2-gpus)
+7. [Metrics Computation](#7-metrics-computation)
+8. [Experiment Runner](#8-experiment-runner)
+9. [End-to-End Data Flow Diagram](#9-end-to-end-data-flow-diagram)
+
+> **Note on simulator code:** The repo also contains a parametric simulator (`src/simulator/`) used for controlled sweeps and a Stage B profiling pipeline (`src/stage_b/profile_sharegpt.py`, `fitted_timing.py`) that fits simulator coefficients from GPU measurements. Those are secondary; this document focuses on the real-GPU path.
 
 ---
 
@@ -31,9 +29,9 @@ LLM inference has two distinct phases:
 
 When both phases share the same GPU(s), **prefill disrupts decode**. A long prefill from one request steals GPU cycles from the decode steps of many other in-flight requests, causing spikes in tail latency and poor SLO goodput.
 
-DistServe's solution: **separate prefill and decode into dedicated worker pools**, giving each phase its own scheduling lane and eliminating the interference.
+DistServe's solution: **separate prefill and decode into dedicated worker pools**, giving each phase its own scheduling lane and eliminating the interference. The KV cache is transferred between GPUs after prefill completes.
 
-This repo implements and evaluates both designs: colocated and disaggregated.
+This repo implements and evaluates both designs on real hardware: **colocated** (single GPU) vs **disaggregated** (two GPUs).
 
 ---
 
@@ -46,10 +44,10 @@ Every inference request is a `Request` object:
 ```
 Request
   request_id        unique integer ID
-  arrival_time      simulated or real wall-clock arrival (seconds)
-  prompt_tokens     number of input tokens
+  arrival_time      wall-clock arrival (seconds)
+  prompt_tokens     number of input tokens (from tokenizer)
   output_tokens     number of tokens to generate
-  prompt_text       optional: actual text (used in GPU runs for tokenization)
+  prompt_text       actual prompt string (from ShareGPT)
 ```
 
 After a request completes, it becomes a `RequestResult`:
@@ -71,301 +69,114 @@ RequestResult
 
 **Step-by-step lifecycle of a request:**
 
-1. Created by the workload generator with an arrival time and token counts.
-2. Queued in the simulator or placed in a real-GPU pipeline.
-3. Prefill runs: first token time is recorded.
-4. Decode runs: finish time is recorded.
+1. Built by the ShareGPT workload generator with an arrival time, tokenized prompt, and sampled output length.
+2. Queued in the GPU runtime (colocated or disaggregated).
+3. Prefill runs on GPU: first token time is recorded.
+4. Decode runs on GPU: finish time is recorded.
 5. Becomes a `RequestResult` and is passed to the metrics layer.
 
 ---
 
-## 3. Timing Model
+## 3. ShareGPT Workload Generation
 
-**File:** `src/simulator/timing.py`
+**Files:** `src/stage_b/sharegpt_loader.py`, `src/stage_b/workload_sharegpt.py`
 
-The simulator does not run actual GPU kernels. Instead it uses a `TimingModel` — a parametric model of how long each operation takes.
+The workload generator produces a list of `Request` objects with **real prompts** drawn from the ShareGPT conversation corpus.
 
+### Step 1 — Load ShareGPT conversations
+
+`sharegpt_loader.py` supports two sources:
+
+**HuggingFace hub (default):**
 ```
-TimingModel fields (all in seconds):
-  prefill_base              = 0.020       base overhead per batch
-  prefill_per_token         = 0.00020     extra cost per input token
-  decode_base               = 0.004       base overhead per decode step
-  decode_per_token          = 0.0025      extra cost per token in batch
-  transfer_per_prompt_token = 0.000015    KV transfer cost per prompt token
-  colocated_interference    = 1.35        slowdown multiplier for colocated runs
-  prefill_capacity_mult     = 1.0         models under-provisioned prefill GPU
-  decode_capacity_mult      = 1.0         models under-provisioned decode GPU
-  prefill_batch_alpha       = 0.20        batch efficiency exponent for prefill
-  decode_batch_alpha        = 0.10        batch efficiency exponent for decode
+iter_sharegpt_from_hf(
+  dataset_name = "Aeala/ShareGPT_Vicuna_unfiltered",
+  split        = "train",
+  max_samples  = num_requests * 4
+)
 ```
+Falls back across mirrors (`anon8231489123/ShareGPT_Vicuna_unfiltered`) if the primary dataset fails to load. Rows pulled are capped at `max_samples * 10` to avoid huge downloads.
 
-**How each timing function works:**
-
-### `prefill_time(prompt_tokens, batch_size)`
-
+**Local JSONL file:**
 ```
-speedup = batch_size ^ prefill_batch_alpha
-          (larger batches share overhead → sub-linear scaling)
-
-time = (prefill_base + prefill_per_token * prompt_tokens)
-       / speedup
-       * prefill_capacity_multiplier
+iter_sharegpt_jsonl(path, max_samples)
 ```
+Parses a `.jsonl` file with the same `{conversations: [...]}` schema.
 
-The batch exponent (0.20) captures that doubling the batch does not double the prefill time — GPU parallelism absorbs some of the overhead.
+### Step 2 — Extract the prompt from each conversation
 
-### `decode_step_time(batch_size)`
-
-```
-speedup = batch_size ^ decode_batch_alpha
-
-time = (decode_base + decode_per_token)
-       / speedup
-       * decode_capacity_multiplier
+Each ShareGPT row has a `conversations` array of turns like:
+```json
+{"from": "human", "value": "Explain how gradient descent works..."}
+{"from": "gpt",   "value": "Gradient descent is..."}
 ```
 
-Decode is memory-bandwidth bound. The exponent is smaller (0.10) because batching helps less here.
-
-### `transfer_time(prompt_tokens)`
-
+`_conversation_to_prompt()` walks the turns:
 ```
-time = transfer_per_prompt_token * prompt_tokens
-```
-
-Linear in prompt length because the KV cache size scales with the number of prompt tokens.
-
-These coefficients can be set from the defaults or replaced with values fitted from real GPU measurements (Stage B).
-
----
-
-## 4. Workload Generation
-
-**File:** `src/simulator/workload.py`
-
-The workload generator produces a list of `Request` objects that simulate clients sending requests over time.
-
-### Arrival process
-
-Two modes:
-
-**Poisson:**
-```
-inter-arrival gap = -log(uniform(0,1)) / arrival_rate
-```
-This gives exponentially distributed gaps — the standard model for independent client arrivals.
-
-**Bursty:**
-```
-for each request:
-  with probability burst_prob:
-    use arrival_rate * burst_rate_multiplier
-  else:
-    use arrival_rate
-  inter-arrival gap = exponential(chosen_rate)
-```
-This creates clusters of arrivals separated by quieter periods, stressing the system more realistically.
-
-### Token sizes
-
-**Simple (uniform):**
-```
-prompt_tokens = randint(prompt_low, prompt_high)
-output_tokens = randint(output_low, output_high)
+for turn in conversation:
+  role  = turn["from"] or turn["role"]
+  value = turn["value"] or turn["content"]
+  if role in {human, user, system} and value non-empty:
+    append value
+  if role in {human, user}:
+    break    # stop after first user turn → stable "chat prompt"
 ```
 
-**Mixed (interactive + long-prompt):**
-```
-with probability interactive_frac:
-  prompt_tokens = randint(32, 128)     # short interactive prompt
-  output_tokens = randint(16, 64)      # short output
-else:
-  prompt_tokens = randint(256, 1024)   # long prompt
-  output_tokens = randint(64, 256)     # longer output
-```
+This produces a single prompt string per conversation (no model turns, no multi-turn context).
 
-The mixed workload is the critical one for demonstrating DistServe's value: long prefills from the second class interfere with the low-latency demands of the first class.
+### Step 3 — Build requests with real token counts
 
-All randomness is seeded, so results are reproducible.
-
----
-
-## 5. Colocated (Baseline) Simulator
-
-**File:** `src/simulator/baseline.py`
-
-This simulates a single GPU pool where prefill and decode share the same execution lane.
-
-### State
+`build_requests_from_sharegpt()`:
 
 ```
-pending    sorted list of requests by arrival_time
-now        current simulated clock (seconds)
-results    list of RequestResult
-```
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+if tokenizer.pad_token is None:
+  tokenizer.pad_token = tokenizer.eos_token
 
-### Main loop (step by step)
+rng = Random(seed)
+t = 0.0
+for sample in sharegpt_samples:
+  enc = tokenizer(
+    sample.text,
+    truncation  = True,
+    max_length  = max_prompt_tokens
+  )
+  prompt_tokens = len(enc["input_ids"])
+  if prompt_tokens < 6:
+    skip    # drop trivially short prompts
 
-**Step 1 — Advance time to next batch**
+  # Poisson arrival: exponential inter-arrival gaps
+  if arrival_rate > 0:
+    t += rng.expovariate(arrival_rate)
 
-```
-next_arrival = pending[0].arrival_time
-now = max(now, next_arrival)
+  # Sample decode length uniformly
+  output_tokens = rng.randint(output_low, output_high)
 
-# optionally wait batch_wait_s to form a larger batch
-if batch_wait_s > 0:
-  now = max(now, next_arrival + batch_wait_s)
-```
-
-**Step 2 — Form a batch**
-
-Take up to `max_batch_size` requests that have arrived by `now`:
-```
-batch = [r for r in pending if r.arrival_time <= now][:max_batch_size]
-remove batch from pending
-```
-
-**Step 3 — Prefill the batch (all at once)**
-
-```
-# The interference multiplier slows down prefill on the colocated GPU
-# because decode from other in-flight requests is competing
-prefill_s = timing.prefill_time(avg_prompt_tokens, batch_size)
-           * colocated_interference
-
-prefill_done = now + prefill_s
-```
-
-**Step 4 — First decode step**
-
-```
-# Also slowed by interference
-step_s = timing.decode_step_time(batch_size) * colocated_interference
-
-first_token_time = prefill_done + step_s  # same for all requests in batch
-```
-
-**Step 5 — Remaining decode steps**
-
-```
-for each request in batch:
-  remaining = request.output_tokens - 1
-  finish_time = first_token_time + remaining * step_s
-  record RequestResult(arrival, first_token_time, finish_time)
-```
-
-**Step 6 — Advance clock**
-
-```
-now = max(finish_time for all requests in batch)
-```
-
-Repeat until `pending` is empty.
-
-### Key property
-
-All requests in the same batch share the same `prefill_done` and the same `step_s`. The colocated interference multiplier (1.35) inflates both prefill and decode times globally — a simplified model of GPU resource contention.
-
----
-
-## 6. Disaggregated Simulator
-
-**File:** `src/simulator/disaggregated.py`
-
-This simulates two separate pools: a **prefill pool** and a **decode pool**, with a KV transfer in between.
-
-### State
-
-```
-prefill_q    pending requests sorted by arrival_time
-decode_q     requests ready for decode, sorted by eligibility_time
-prefill_now  clock for the prefill pool
-decode_now   clock for the decode pool
-results      list of RequestResult
-```
-
-### Phase 1 — Prefill Pool
-
-**Step 1 — Advance prefill clock**
-
-```
-next_arrival = prefill_q[0].arrival_time
-prefill_now = max(prefill_now, next_arrival)
-```
-
-**Step 2 — Form prefill batch** (same logic as colocated, using `prefill_max_batch`)
-
-**Step 3 — Run prefill (no interference)**
-
-```
-prefill_s = timing.prefill_time(avg_prompt_tokens, batch_size)
-# No colocated_interference multiplier — dedicated GPU
-prefill_done = prefill_now + prefill_s
-```
-
-**Step 4 — Account for KV transfer and queue for decode**
-
-```
-for each request in prefill_batch:
-  transfer_s = timing.transfer_time(request.prompt_tokens)
-  eligible_for_decode = prefill_done + transfer_s
-  add to decode_q with eligibility_time = eligible_for_decode
-```
-
-**Step 5 — Advance prefill clock**
-
-```
-prefill_now = prefill_done
-```
-
-Repeat until `prefill_q` is empty. This populates `decode_q`.
-
-### Phase 2 — Decode Pool
-
-Processes requests from `decode_q` in eligibility order.
-
-**Step 1 — Advance decode clock**
-
-```
-next_eligible = decode_q[0].eligibility_time
-decode_now = max(decode_now, next_eligible)
-```
-
-**Step 2 — Form decode batch**
-
-Take up to `decode_max_batch` requests eligible by `decode_now`.
-
-**Step 3 — Run decode steps (no interference)**
-
-```
-step_s = timing.decode_step_time(batch_size)
-first_token_time = decode_now + step_s
-
-for each request in decode_batch:
-  remaining = request.output_tokens - 1
-  finish_time = first_token_time + remaining * step_s
-  record RequestResult(
-    arrival_time = original_arrival_time,  # not the eligibility_time
-    first_token_time = first_token_time,
-    finish_time = finish_time
+  Request(
+    request_id    = rid,
+    arrival_time  = t,
+    prompt_tokens = prompt_tokens,
+    output_tokens = output_tokens,
+    prompt_text   = sample.text
   )
 ```
 
-**Step 4 — Advance decode clock**
+### Key workload properties
 
-```
-decode_now = max(finish_time for requests in batch)
-```
+| Knob | Purpose | Typical value |
+|---|---|---|
+| `tokenizer_name` | Must match the serving model | `TinyLlama/TinyLlama-1.1B-Chat-v1.0` |
+| `max_prompt_tokens` | Truncates long ShareGPT prompts | 1024–2048 |
+| `output_low`, `output_high` | Uniform range for generated tokens per request | 16, 64 |
+| `arrival_rate` | Poisson rate in req/s | 1.0–4.0 |
+| `num_requests` | Total requests in the run | 15–300 |
+| `seed` | RNG seed for reproducibility | 7 |
 
-### Why this is better
-
-- Prefill runs with no decode interference → faster prefill → lower TTFT
-- Decode runs with no prefill interference → more consistent step time → lower TPOT
-- The cost is the KV transfer delay, which adds to TTFT but is typically small
-- Separate batch size knobs: `prefill_max_batch` and `decode_max_batch` can be tuned independently
+**Why ShareGPT?** Real conversational prompts have naturally skewed length distributions — a mix of short interactive turns and long context-heavy prompts. That skew is exactly the workload that makes disaggregation valuable: long prefills from a few requests would otherwise stall decode for everyone else.
 
 ---
 
-## 7. Real GPU Runtime — Shared Inference Core
+## 4. Real GPU Runtime — Shared Inference Core
 
 **File:** `src/runtime/inference_core.py`
 
@@ -378,8 +189,8 @@ torch.cuda.synchronize(device)       # flush any pending GPU work
 t0 = time.perf_counter()
 
 outputs = model(
-  input_ids=input_ids,
-  use_cache=True                     # tells HuggingFace to return past_key_values
+  input_ids = input_ids,
+  use_cache = True                   # tells HuggingFace to return past_key_values
 )
 
 torch.cuda.synchronize(device)       # wait for GPU to finish
@@ -465,11 +276,11 @@ Works for both single-request and batched KV caches since it moves tensors gener
 
 ---
 
-## 8. Real GPU Runtime — Baseline (1 GPU)
+## 5. Real GPU Runtime — Baseline (1 GPU, Colocated)
 
 **File:** `src/runtime/baseline_gpu.py`
 
-Runs requests on a single GPU in arrival order, grouped into batches of up to `batch_size`. This is the colocated reference point for real GPU experiments.
+Runs requests on a single GPU in arrival order, grouped into batches of up to `batch_size`. This is the colocated reference point — prefill and decode share the same device and queue.
 
 ### Setup
 
@@ -523,13 +334,13 @@ while requests remain:
 ```
 
 **Key properties:**
-- All requests in a batch share the same `first_token_time` — this mirrors the simulator's behaviour.
+- All requests in a batch share the same `first_token_time`.
 - Per-request `finish_time` uses only the decode steps that request actually needs, so shorter requests finish earlier on the timeline even though the GPU runs the full `max_out` steps.
-- TTFT includes queuing time (`t_start - arrival_time`). If arrivals are faster than processing, the queue grows and TTFT rises — the same pressure the simulator models.
+- TTFT includes queuing time (`t_start - arrival_time`). If arrivals are faster than processing, the queue grows and TTFT rises.
 
 ---
 
-## 9. Real GPU Runtime — Disaggregated (2 GPUs)
+## 6. Real GPU Runtime — Disaggregated (2 GPUs)
 
 **File:** `src/runtime/disaggregated_gpu.py`
 
@@ -596,117 +407,20 @@ while requests remain:
     pipeline_free = t_start + prefill_s + transfer_s + sum(step_times)
 ```
 
-### What this measures vs the simulator
+### What each component measures
 
-| Component | Simulator | GPU runtime (batch_size=1) | GPU runtime (batch_size>1) |
-|---|---|---|---|
-| Prefill time | `prefill_base + prefill_per_token * N` | Actual HF forward, 1 request | Actual HF forward, B requests padded |
-| Decode step | `decode_base + decode_per_token` | Actual HF forward, 1 request | Actual HF forward, B requests |
-| KV transfer | `transfer_per_prompt_token * N` | Actual `.to(device)`, 1 KV | Actual `.to(device)`, batched KV |
-| Interference | Multiplier (1.35) | None | None |
+| Component | GPU runtime (batch_size=1) | GPU runtime (batch_size>1) |
+|---|---|---|
+| Prefill time | Actual HF forward, 1 request | Actual HF forward, B requests left-padded |
+| Decode step | Actual HF forward, 1 request | Actual HF forward, B requests |
+| KV transfer | Actual `.to(device)`, 1 KV | Actual `.to(device)`, batched KV |
+| Interference | None | None |
 
 The pipeline is sequential across batches (one batch completes before the next starts). Within a batch, prefill and decode are parallelised across the `B` requests. Full pipelining overlap between batches is a next step.
 
 ---
 
-## 10. Stage B — Profiling and Fitting Real GPU Timings
-
-**Files:** `src/stage_b/profile_sharegpt.py`, `src/stage_b/fitted_timing.py`, `src/stage_b/sharegpt_loader.py`, `src/stage_b/workload_sharegpt.py`
-
-Stage B replaces the synthetic timing model with coefficients measured from real GPU runs.
-
-### Step 1 — Load ShareGPT prompts
-
-`sharegpt_loader.py` handles two sources:
-
-```
-HuggingFace hub:  iter_sharegpt_from_hf(num_rows)
-  → streams Aeala/ShareGPT_Vicuna_unfiltered dataset
-  → extracts first user message from each conversation
-
-Local JSONL file: iter_sharegpt_jsonl(path)
-  → parses .jsonl with conversation format
-  → same extraction logic
-```
-
-### Step 2 — Build requests with real token counts
-
-`workload_sharegpt.py` → `build_requests_from_sharegpt()`:
-
-```
-for each prompt_text from ShareGPT:
-  input_ids = tokenizer(prompt_text)
-  prompt_tokens = len(input_ids)
-  output_tokens = randint(min_new_tokens, max_new_tokens)
-
-  arrival_time = cumulative sum of exponential(arrival_rate) gaps
-
-  → Request(prompt_tokens, output_tokens, prompt_text, arrival_time)
-```
-
-### Step 3 — Measure GPU timings
-
-`profile_sharegpt.py` runs on a single GPU:
-
-```
-for each request (up to max_samples):
-  input_ids = tokenize(prompt_text, max_tokens=max_prompt_tokens)
-
-  prefill_s, past, next_token = timed_prefill(model, input_ids, device)
-  step_times, _ = timed_decode_steps(model, past, next_token, max_new_tokens, device)
-
-  collect:
-    prompt_tokens[i] = len(input_ids)
-    prefill_times[i] = prefill_s
-    decode_steps[i]  = step_times   (list of per-step times)
-```
-
-### Step 4 — Fit the linear prefill model
-
-`fitted_timing.py` → `fit_prefill_linear(prompt_tokens, prefill_times)`:
-
-```
-Least-squares fit: prefill_s ≈ a + b * prompt_tokens
-
-n = len(samples)
-sum_x  = sum(prompt_tokens)
-sum_y  = sum(prefill_times)
-sum_xy = sum(prompt_tokens[i] * prefill_times[i])
-sum_xx = sum(prompt_tokens[i]^2)
-
-b = (n * sum_xy - sum_x * sum_y) / (n * sum_xx - sum_x^2)
-a = (sum_y - b * sum_x) / n
-```
-
-The slope `b` = `prefill_per_token`, the intercept `a` = `prefill_base`.
-
-### Step 5 — Write fitted_timing.json
-
-```json
-{
-  "timing": {
-    "prefill_base":              a,
-    "prefill_per_token":         b,
-    "decode_base":               mean(all_step_times),
-    "decode_per_token":          0.0,
-    "transfer_per_prompt_token": 1.5e-5
-  },
-  "meta": {
-    "model":                "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    "dataset":              "ShareGPT",
-    "num_samples_profiled": N,
-    "device":               "cuda"
-  }
-}
-```
-
-### Step 6 — Feed back into simulator
-
-`run_comparison.py --timing-json results/fitted_timing.json` loads this file and replaces the synthetic `TimingModel` defaults with the measured values. The simulator then runs with real-GPU-calibrated coefficients.
-
----
-
-## 11. Metrics Computation
+## 7. Metrics Computation
 
 **File:** `src/core/metrics.py`
 
@@ -716,7 +430,7 @@ The slope `b` = `prefill_per_token`, the intercept `a` = `prefill_base`.
 SLOConfig
   ttft_slo   = 0.8 s    (default)
   tpot_slo   = 0.03 s   (default)
-  e2e_slo    = None      (optional)
+  e2e_slo    = None     (optional)
 ```
 
 ### `summarize_results(results, slo)` — step by step
@@ -759,91 +473,69 @@ All values are returned as a dictionary and written to a `*-summary.json` file. 
 
 ---
 
-## 12. Experiment Runners
-
-### `run_comparison.py` — Simulator comparison
-
-```
-1. Parse args (workload type, timing source, num_requests, arrival_rate, SLOs, batching)
-2. Build TimingModel:
-   - if --timing-json: load measured coefficients from Stage B
-   - else: use synthetic defaults
-3. Generate requests:
-   - if --workload sharegpt: build_requests_from_sharegpt(model, num_requests)
-   - else: generate_requests(WorkloadConfig)
-4. Run colocated simulator → results_colocated
-5. Run disaggregated simulator → results_disaggregated
-6. Compute metrics for both
-7. Print comparison table
-8. Write CSVs and summary JSON to results/ with timestamp prefix
-```
-
-### `run_ablations.py` — Sensitivity sweeps
-
-```
-1. Build base TimingModel and WorkloadConfig
-2. Sweep 1: KV transfer cost
-   for transfer_per_prompt_token in [0.0, 5e-6, 1e-5, 1.5e-5, 2e-5, 3e-5, 4.5e-5, 6e-5]:
-     build TimingModel with this value
-     run colocated and disaggregated simulators
-     record: goodput, p95_ttft, p99_e2e for both
-3. Sweep 2: capacity split
-   for (prefill_mult, decode_mult) in [(0.8,1.2), (1.0,1.0), (1.2,0.8), (1.4,0.7)]:
-     build TimingModel with these multipliers
-     run both simulators
-     record same metrics
-4. Write combined CSV and meta JSON
-```
+## 8. Experiment Runner
 
 ### `run_gpu_comparison.py` — Real GPU comparison
 
 ```
-1. Parse args (model, num_requests, prefill_gpu, decode_gpu, baseline_only, batch_size)
-2. Run baseline_gpu.run(model, num_requests, gpu=prefill_gpu, batch_size=batch_size)
+1. Parse args (model, num_requests, prefill_gpu, decode_gpu, baseline_only, batch_size,
+               sharegpt dataset/jsonl, arrival_rate, SLOs)
+2. Build requests from ShareGPT:
+   requests = build_requests_from_sharegpt(
+     tokenizer_name    = model,
+     dataset_name      = "Aeala/ShareGPT_Vicuna_unfiltered",
+     num_requests      = N,
+     max_prompt_tokens = 1024,
+     output_low        = 16,
+     output_high       = 64,
+     arrival_rate      = rate,
+     seed              = 7
+   )
+3. Run baseline_gpu.run(model, requests, gpu=prefill_gpu, batch_size=batch_size)
    → results_colocated
-3. if not baseline_only:
-   Run disaggregated_gpu.run(model, num_requests, prefill_gpu, decode_gpu, batch_size=batch_size)
+4. if not baseline_only:
+   Run disaggregated_gpu.run(model, requests, prefill_gpu, decode_gpu, batch_size=batch_size)
    → results_disaggregated
-4. Compute metrics for both
-5. Print comparison table
-6. Write CSVs and summary JSON (includes batch_size) to results/ with timestamp prefix
+5. Compute metrics for both with SLOConfig
+6. Print comparison table
+7. Write CSVs and summary JSON (includes batch_size) to results/ with timestamp prefix
 ```
 
 `--batch-size` (default `1`) controls how many requests are grouped into a single padded forward call for both prefill and decode. `batch_size=1` is identical to the original sequential behaviour.
 
 ---
 
-## 13. End-to-End Data Flow Diagram
+## 9. End-to-End Data Flow Diagram
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│                  Workload Generator                 │
-│  (workload.py / workload_sharegpt.py)               │
+│         ShareGPT Workload Generator                 │
+│  (sharegpt_loader.py + workload_sharegpt.py)        │
 │                                                     │
-│  Arrival times (Poisson / Bursty)                   │
-│  Token counts (Uniform / Mixed / ShareGPT)          │
+│  1. Load Aeala/ShareGPT_Vicuna_unfiltered from HF   │
+│  2. Extract first user turn from each conversation  │
+│  3. Tokenize with model tokenizer (TinyLlama)       │
+│  4. Assign Poisson arrivals, uniform output lengths │
 └─────────────────────────────┬───────────────────────┘
                               │  List[Request]
-              ┌───────────────┼───────────────┐
+                              │  (real prompt_text + token counts)
+              ┌───────────────┴───────────────┐
               │                               │
               ▼                               ▼
 ┌─────────────────────────┐   ┌─────────────────────────┐
-│   SIMULATOR PATH        │   │   REAL GPU PATH         │
+│   BASELINE GPU          │   │   DISAGGREGATED GPU     │
+│   (baseline_gpu.py)     │   │   (disaggregated_gpu.py)│
 │                         │   │                         │
-│  TimingModel            │   │  inference_core.py      │
-│  (timing.py)            │   │  - timed_prefill()      │
-│  - prefill_time()       │   │  - timed_decode_steps() │
-│  - decode_step_time()   │   │  - time_transfer()      │
-│  - transfer_time()      │   │                         │
-│                         │   │  baseline_gpu.py        │
-│  baseline.py            │   │  - 1 GPU, sequential    │
-│  - single pool          │   │  - prefill → decode     │
-│  - interference × 1.35  │   │                         │
-│                         │   │  disaggregated_gpu.py   │
-│  disaggregated.py       │   │  - GPU A: prefill       │
-│  - prefill pool         │   │  - .to(GPU B): KV copy  │
-│  - KV transfer cost     │   │  - GPU B: decode        │
-│  - decode pool          │   │                         │
+│  Single GPU, FIFO       │   │  GPU A: prefill pool    │
+│  ├─ tokenize_batch      │   │  ├─ tokenize_batch      │
+│  ├─ timed_prefill_batch │   │  ├─ timed_prefill_batch │
+│  └─ timed_decode_steps  │   │  │                      │
+│     _batch              │   │  time_transfer          │
+│                         │   │  └─ .to(GPU B) KV copy  │
+│  Prefill + decode share │   │                         │
+│  the same device queue  │   │  GPU B: decode pool     │
+│                         │   │  └─ timed_decode_steps  │
+│                         │   │     _batch              │
 └────────────┬────────────┘   └────────────┬────────────┘
              │                             │
              │  List[RequestResult]        │  List[RequestResult]
@@ -865,26 +557,6 @@ All values are returned as a dictionary and written to a `*-summary.json` file. 
                    ┌─────────┴──────────┐
                    ▼                    ▼
          results/*-requests.csv    results/*-summary.json
-
-
-┌───────────────────────────────────────┐
-│         STAGE B PIPELINE              │
-│                                       │
-│  ShareGPT prompts                     │
-│        ↓                              │
-│  profile_sharegpt.py                  │
-│  - timed_prefill() on real GPU        │
-│  - timed_decode_steps()               │
-│        ↓                              │
-│  fit_prefill_linear()                 │
-│  - least-squares: a + b * tokens      │
-│        ↓                              │
-│  fitted_timing.json                   │
-│        ↓                              │
-│  run_comparison.py --timing-json      │
-│  - replaces synthetic TimingModel     │
-│  - simulator runs with real numbers   │
-└───────────────────────────────────────┘
 ```
 
 ---
@@ -893,13 +565,11 @@ All values are returned as a dictionary and written to a `*-summary.json` file. 
 
 | Decision | Rationale |
 |---|---|
-| No Ray, no SwiftTransformer | Course constraints; Ray actors/placement groups not available |
 | Python-only, PyTorch + HuggingFace | Portable, inspectable, works on 1–2 GPU nodes |
-| Simulator + real GPU two-track | Simulator enables large controlled sweeps; GPU run validates direction |
-| `colocated_interference = 1.35` | Empirical estimate of prefill/decode contention on shared GPU |
-| Batch exponents (0.20, 0.10) | Sub-linear batch speedup: GPU parallelism partially absorbs overhead |
-| Stage B fitting pipeline | Grounds simulator in real measurements rather than synthetic constants |
-| Same-node KV transfer only | Sufficient for demonstrating the architectural idea; cross-node is follow-on |
+| ShareGPT prompts for the workload | Real conversational length distribution exposes the prefill/decode skew that motivates disaggregation |
+| First-user-turn-only extraction | Stable single-prompt-per-request semantics; no multi-turn context drift |
+| Two model instances in disaggregated mode | Simpler than sharding — each GPU owns a full copy so prefill and decode are fully independent |
 | Left-padding for batched tokenization | Ensures `logits[:, -1:, :]` picks the correct next token for every sequence in the batch regardless of prompt length |
-| Batched KV transfer as a unit | Moving all `B` requests' KV in one `time_transfer` call avoids per-request round-trip overhead and keeps the transfer measurement representative |
+| Batched KV transfer as a unit | Moving all `B` requests' KV in one `time_transfer` call avoids per-request round-trip overhead |
+| Same-node KV transfer only | Sufficient for demonstrating the architectural idea; cross-node is follow-on |
 | Sequential batched pipeline | Batches complete one at a time; full inter-batch pipelining (prefill overlapping with decode) is a follow-on step |
