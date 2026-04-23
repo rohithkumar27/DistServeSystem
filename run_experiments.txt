@@ -1,0 +1,154 @@
+# ============================================================
+# DistServeSystem — Experiment Commands for Course Report
+# ============================================================
+# Run these in order. Each section depends on the previous.
+# All commands assume you are in the DistServeSystem directory
+# and the phyreagent conda env is active.
+#
+# GPU allocation (2x A16, needed for disaggregated):
+#   salloc --nodes=1 --gres=gpu:a16:2 --partition=gpu-preempt --time=4:00:00 --mem=40G
+#
+# Setup:
+#   module load conda/latest && conda activate phyreagent
+#   cd "/home/udhanuka_umass_edu/RL Med/SYSFORDL/DistServeSystem"
+# ============================================================
+
+
+# ------------------------------------------------------------
+# STEP 0 — Smoke test (verify pipelining fix is working)
+# Expected: PASS with speedup >= 1.10x
+# Runtime: ~5 min
+# ------------------------------------------------------------
+python -m src.experiments.smoke_test_pipelining \
+  --num-requests 12 --batch-size 4 --output-high 64
+
+
+
+# ------------------------------------------------------------
+# STEP 2 — P1: Arrival rate sweep (canonical DistServe figure)
+# --interference-factor 1.3 models the ~30% decode slowdown that
+# a colocated GPU suffers when prefill and decode share it.
+# Without it, colocated is artificially fast and disagg can't win.
+# Runtime: ~25 min
+# ------------------------------------------------------------
+bash run_workload_sweep.sh \
+  --batch-sizes 4,8 \
+  --num-requests 32 \
+  --arrival-rates 0.0,0.5,1.0,2.0,3.0,4.0 \
+  --output-low 8 --output-high 64 \
+  --interference-factor 1.3 \
+  --out-dir results/report/arrival_sweep
+
+# Plot arrival sweep
+python -m src.experiments.plot_workload_sweep_gpu \
+  --csv results/report/arrival_sweep/summary.csv \
+  --out-dir results/report/arrival_sweep/plots
+
+
+# ------------------------------------------------------------
+# STEP 3 — P2: Batch size sweep at fixed load
+# Runtime: ~20 min
+# ------------------------------------------------------------
+bash run_workload_sweep.sh \
+  --batch-sizes 1,2,4,8,16 \
+  --num-requests 64 \
+  --arrival-rates 0.0 \
+  --output-low 8 --output-high 64 \
+  --interference-factor 1.3 \
+  --out-dir results/report/batch_sweep
+
+# Plot batch sweep
+python -m src.experiments.plot_workload_sweep_gpu \
+  --csv results/report/batch_sweep/summary.csv \
+  --out-dir results/report/batch_sweep/plots
+
+python -m src.experiments.plot_gpu_batch_sweep \
+  --csv results/milestone/gpu_batch_sweep.csv \
+  --out-dir results/report/plots
+
+
+# ------------------------------------------------------------
+# STEP 4 — P3: Decode-heavy workload (longer output tokens)
+# Runtime: ~25 min
+# ------------------------------------------------------------
+bash run_workload_sweep.sh \
+  --batch-sizes 4,8 \
+  --num-requests 32 \
+  --arrival-rates 0.0,2.0 \
+  --output-low 64 --output-high 256 \
+  --interference-factor 1.3 \
+  --out-dir results/report/decode_heavy
+
+# Plot decode-heavy
+python -m src.experiments.plot_workload_sweep_gpu \
+  --csv results/report/decode_heavy/summary.csv \
+  --out-dir results/report/decode_heavy/plots
+
+
+# ------------------------------------------------------------
+# STEP 5 — P4: TTFT CDF plots (from P1 data, no new GPU run)
+# Runtime: < 1 min
+# ------------------------------------------------------------
+python -m src.experiments.plot_ttft_cdf \
+  --in-dir results/report/arrival_sweep \
+  --arrival-rates 0.0,2.0,4.0 \
+  --batch-sizes 4,8 \
+  --ttft-slo 2.0 \
+  --out-dir results/report/arrival_sweep/plots
+
+
+# ------------------------------------------------------------
+# STEP 6 — P5: SLO threshold sensitivity (from P1 data, no new GPU run)
+# Runtime: < 1 min
+# ------------------------------------------------------------
+Step 1 — run inference once (Step 2 in your experiments file, already there):
+
+
+bash run_workload_sweep.sh \
+  --batch-sizes 4,8 --num-requests 32 \
+  --arrival-rates 0.0 \
+  --interference-factor 1.3 \
+  --out-dir results/report/arrival_sweep
+Step 2 — sweep SLO thresholds offline (Step 6, already there):
+
+
+python -m src.experiments.plot_goodput_vs_slo \
+  --in-dir results/report/arrival_sweep \
+  --arrival-rates 0.0 \
+  --batch-sizes 4,8 \
+  --ttft-slos 0.5,1.0,1.5,2.0,2.5,3.0 \
+  --out-dir results/report/arrival_sweep/plots
+
+# ------------------------------------------------------------
+# STEP 7 — Gantt diagram (no data needed, just timing args)
+# Use your actual measured prefill/decode times if known.
+# Runtime: < 5 sec
+# ------------------------------------------------------------
+python -m src.experiments.plot_pipeline_gantt \
+  --prefill 0.45 --transfer 0.10 --decode 0.65 \
+  --batches 4 \
+  --out results/report/plots/pipeline_gantt.png
+
+
+# ------------------------------------------------------------
+# STEP 8 — P6 (optional): Larger request scale (64 requests)
+# Runtime: ~30 min
+# ------------------------------------------------------------
+bash run_workload_sweep.sh \
+  --batch-sizes 8 \
+  --num-requests 64 \
+  --arrival-rates 0.0,2.0 \
+  --output-low 8 --output-high 64 \
+  --interference-factor 1.3 \
+  --out-dir results/report/scale_64
+
+python -m src.experiments.plot_workload_sweep_gpu \
+  --csv results/report/scale_64/summary.csv \
+  --out-dir results/report/scale_64/plots
+
+
+# ------------------------------------------------------------
+# All results land in results/report/
+# Figures for report: arrival_sweep/plots/, batch_sweep/plots/,
+#   decode_heavy/plots/, plots/ (gantt, load_sweep, workload_mix)
+# ------------------------------------------------------------

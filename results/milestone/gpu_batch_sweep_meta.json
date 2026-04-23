@@ -1,0 +1,26 @@
+{
+  "baseline_gpu": 0,
+  "baseline_only": false,
+  "batch_sizes": [
+    1,
+    2,
+    4,
+    8
+  ],
+  "dataset": "Aeala/ShareGPT_Vicuna_unfiltered",
+  "decode_gpu": 1,
+  "description": "Throughput and latency vs batch_size for colocated and disaggregated GPU runtimes",
+  "experiment": "gpu_batch_sweep",
+  "max_prompt_tokens": 512,
+  "model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+  "num_requests": 32,
+  "output_range": [
+    8,
+    32
+  ],
+  "prefill_gpu": 0,
+  "slo": {
+    "tpot_slo": 0.05,
+    "ttft_slo": 2.0
+  }
+}

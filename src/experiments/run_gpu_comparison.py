@@ -28,10 +28,10 @@ from src.stage_b.workload_sharegpt import build_requests_from_sharegpt
 def main() -> None:
     parser = argparse.ArgumentParser(description="Real GPU baseline vs disaggregated")
     parser.add_argument("--model", type=str, default="TinyLlama/TinyLlama-1.1B-Chat-v1.0")
-    parser.add_argument("--num-requests", type=int, default=20)
+    parser.add_argument("--num-requests", type=int, default=50)
     parser.add_argument("--max-prompt-tokens", type=int, default=1024)
-    parser.add_argument("--output-low", type=int, default=8)
-    parser.add_argument("--output-high", type=int, default=32)
+    parser.add_argument("--output-low", type=int, default=16)
+    parser.add_argument("--output-high", type=int, default=64)
     parser.add_argument("--arrival-rate", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--sharegpt-dataset", type=str, default="Aeala/ShareGPT_Vicuna_unfiltered")
@@ -44,6 +44,15 @@ def main() -> None:
                              "1 = original sequential behaviour.")
     parser.add_argument("--ttft-slo", type=float, default=2.0)
     parser.add_argument("--tpot-slo", type=float, default=0.05)
+    parser.add_argument(
+        "--interference-factor", type=float, default=1.3,
+        help="Decode step slowdown applied to the colocated baseline to model "
+             "prefill-decode interference (the core colocated penalty DistServe "
+             "eliminates).  1.0 = no interference (pure FIFO).  "
+             "~1.3 matches the paper's reported overhead for continuous-batching "
+             "systems where new prefill tokens are injected into ongoing decode "
+             "batches, inflating per-step latency.",
+    )
     parser.add_argument(
         "--baseline-only",
         action="store_true",
@@ -86,7 +95,12 @@ def main() -> None:
     slo = SLOConfig(ttft_slo=args.ttft_slo, tpot_slo=args.tpot_slo, e2e_slo=None)
 
     print("Loading model for baseline (colocated)…")
-    model_b, tok_b = load_model_and_tokenizer(args.model, baseline_dev)
+    model_b, tok_b = load_model_and_tokenizer(
+        args.model, baseline_dev,
+        batch_size=args.batch_size,
+        max_prompt_tokens=args.max_prompt_tokens,
+        max_new_tokens=args.output_high,
+    )
     print("Running baseline GPU…")
     colocated = run_baseline_gpu(
         requests,
@@ -95,6 +109,7 @@ def main() -> None:
         device=baseline_dev,
         max_prompt_tokens=args.max_prompt_tokens,
         batch_size=args.batch_size,
+        interference_factor=args.interference_factor,
     )
     sum_coloc = summarize_results(colocated, slo)
 
@@ -108,7 +123,12 @@ def main() -> None:
         torch.cuda.empty_cache()
 
         print("Loading two model copies for disaggregated…")
-        mp, md, tok_d = load_two_models(args.model, prefill_dev, decode_dev)
+        mp, md, tok_d = load_two_models(
+            args.model, prefill_dev, decode_dev,
+            batch_size=args.batch_size,
+            max_prompt_tokens=args.max_prompt_tokens,
+            max_new_tokens=args.output_high,
+        )
         print("Running disaggregated GPU…")
         disagg = run_disaggregated_gpu(
             requests,
@@ -135,6 +155,7 @@ def main() -> None:
             "model": args.model,
             "num_requests": len(requests),
             "batch_size": args.batch_size,
+            "interference_factor": args.interference_factor,
             "baseline_gpu": args.baseline_gpu,
             "prefill_gpu": args.prefill_gpu,
             "decode_gpu": args.decode_gpu,

@@ -1,0 +1,37 @@
+{
+  "arrival_rates": [
+    0.0
+  ],
+  "baseline_gpu": 0,
+  "baseline_only": false,
+  "batch_sizes": [
+    1,
+    2,
+    4,
+    8,
+    16
+  ],
+  "conditions_completed": 10,
+  "dataset": "Aeala/ShareGPT_Vicuna_unfiltered",
+  "decode_gpu": 1,
+  "experiment": "gpu_workload_sweep",
+  "finished_utc": "2026-04-23T06:15:30.122496+00:00",
+  "max_prompt_tokens": 512,
+  "model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+  "num_requests": [
+    64
+  ],
+  "output_range": [
+    8,
+    64
+  ],
+  "prefill_gpu": 0,
+  "seed": 42,
+  "slo": {
+    "tpot_slo": 0.05,
+    "ttft_slo": 2.0
+  },
+  "started_utc": "2026-04-23T06:11:13.894868+00:00",
+  "total_conditions": 10,
+  "total_elapsed_s": 256.20879673957825
+}
